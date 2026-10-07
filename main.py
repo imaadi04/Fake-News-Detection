@@ -10,14 +10,14 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 load_dotenv()
-BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-FRONTEND = os.path.join(BASE, "frontend")
+BASE = os.path.dirname(os.path.abspath(__file__))
+FRONTEND = BASE
 SERPER_API_KEY = os.getenv("SERPER_API_KEY", "").strip()
 
 app = FastAPI(title="TruthCheck API", version="1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
                    allow_methods=["*"], allow_headers=["*"])
-app.mount("/static", StaticFiles(directory=os.path.join(FRONTEND, "static")), name="static")
+app.mount("/static", StaticFiles(directory=FRONTEND), name="static")
 
 class AnalyzeRequest(BaseModel):
     text: str = Field("", max_length=50000)
