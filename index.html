@@ -1,0 +1,17 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TruthCheck</title><link rel="stylesheet" href="/static/style.css"></head>
+<body><main class="container">
+<header><h1>TruthCheck</h1><p>Check a news claim and see the evidence behind it.</p></header>
+<section class="card input">
+<div class="tabs"><button class="tab active" data-mode="text">Paste text</button><button class="tab" data-mode="url">Article URL</button></div>
+<div id="textMode"><label>News / claim</label><textarea id="newsText" placeholder="Paste a paragraph or news article here..."></textarea></div>
+<div id="urlMode" class="hidden"><label>Article URL</label><input id="newsUrl" placeholder="https://example.com/news-article"></div>
+<button id="analyze" class="primary">Analyze</button><p id="error" class="error hidden"></p></section>
+<p id="loading" class="loading hidden">Analyzing...</p>
+<section id="results" class="hidden">
+<div class="card scoreCard"><div><small>TRUTH SCORE</small><div id="score" class="score">--%</div><strong id="verdict">--</strong></div><span>Based on available evidence and source coverage.</span></div>
+<div class="grid"><section class="card"><div class="head"><h2>Claim analysis</h2><span id="count"></span></div><div id="claims"></div></section>
+<section class="card"><div class="head"><h2>Related real information</h2><span>Sources</span></div><div id="sources"></div><p id="noSources" class="muted hidden">No live sources found.</p></section></div>
+<p id="disclaimer" class="muted"></p></section>
+</main><script src="/static/app.js"></script></body></html>
