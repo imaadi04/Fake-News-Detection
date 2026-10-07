@@ -1,5 +1,6 @@
 import os
 import re
+import json
 from urllib.parse import urlparse
 
 import requests
@@ -17,8 +18,14 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 FRONTEND = BASE
 
 SERPER_API_KEY = os.getenv("SERPER_API_KEY", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
-app = FastAPI(title="TruthCheck API", version="2.0")
+GEMINI_MODEL = "gemini-3.8-flash"
+
+app = FastAPI(
+    title="TruthCheck API",
+    version="3.0"
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -28,7 +35,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.mount("/static", StaticFiles(directory=FRONTEND), name="static")
+app.mount(
+    "/static",
+    StaticFiles(directory=FRONTEND),
+    name="static"
+)
 
 
 class AnalyzeRequest(BaseModel):
@@ -36,63 +47,115 @@ class AnalyzeRequest(BaseModel):
     url: str = Field("", max_length=2000)
 
 
-def clean(s):
-    return re.sub(r"\s+", " ", s or "").strip()
+# =========================================================
+# BASIC HELPERS
+# =========================================================
+
+def clean(text):
+    return re.sub(r"\s+", " ", text or "").strip()
 
 
 def extract_article(url):
     try:
-        r = requests.get(
+        response = requests.get(
             url,
-            timeout=12,
-            headers={"User-Agent": "Mozilla/5.0 TruthCheck/2.0"},
+            timeout=15,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 "
+                    "(Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 "
+                    "Chrome/120 Safari/537.36"
+                )
+            }
         )
 
-        r.raise_for_status()
+        response.raise_for_status()
 
-        soup = BeautifulSoup(r.text, "html.parser")
+        soup = BeautifulSoup(
+            response.text,
+            "html.parser"
+        )
 
-        for tag in soup(["script", "style", "noscript", "nav", "footer", "header"]):
+        for tag in soup([
+            "script",
+            "style",
+            "noscript",
+            "nav",
+            "footer",
+            "header",
+            "aside"
+        ]):
             tag.decompose()
 
-        title = soup.title.get_text(" ", strip=True) if soup.title else url
-
-        body = clean(
-            " ".join(
-                p.get_text(" ", strip=True)
-                for p in soup.find_all("p")
-            )
+        title = (
+            soup.title.get_text(" ", strip=True)
+            if soup.title
+            else url
         )
 
-        if len(body) < 80:
-            body = clean(soup.get_text(" ", strip=True))
+        paragraphs = []
+
+        for p in soup.find_all("p"):
+            text = clean(p.get_text(" ", strip=True))
+
+            if len(text) >= 30:
+                paragraphs.append(text)
+
+        body = clean(" ".join(paragraphs))
+
+        if len(body) < 100:
+            body = clean(
+                soup.get_text(" ", strip=True)
+            )
 
         return title, body[:50000]
 
     except Exception as e:
-        raise HTTPException(400, f"Could not read article URL: {e}")
+        raise HTTPException(
+            400,
+            f"Could not read article URL: {e}"
+        )
 
+
+# =========================================================
+# CLAIM EXTRACTION
+# =========================================================
 
 def claims_from(text):
-    parts = re.split(r"(?<=[.!?])\s+", clean(text))
 
-    claims = [
-        x.strip()
-        for x in parts
-        if 35 <= len(x.strip()) <= 600
-    ]
+    text = clean(text)
 
-    return (claims or [text[:600]])[:8]
+    parts = re.split(
+        r"(?<=[.!?])\s+",
+        text
+    )
+
+    claims = []
+
+    for part in parts:
+
+        part = part.strip()
+
+        if 25 <= len(part) <= 700:
+            claims.append(part)
+
+    if not claims:
+        return [text[:700]]
+
+    return claims[:10]
 
 
-# ---------------------------------------------------------
-# SOURCE RELIABILITY
-# ---------------------------------------------------------
+# =========================================================
+# SOURCE QUALITY
+# =========================================================
 
-def source_reliability(url):
+def source_quality(url):
+
     domain = urlparse(url).netloc.lower()
 
-    trusted = [
+    # Extremely strong sources
+    very_high = [
         ".gov",
         ".gov.in",
         ".nic.in",
@@ -104,201 +167,69 @@ def source_reliability(url):
         "rbi.org.in",
         "nasa.gov",
         "isro.gov.in",
-        "ec.europa.eu",
         "oecd.org",
+        "ec.europa.eu",
+    ]
+
+    for source in very_high:
+        if source in domain:
+            return "very_high"
+
+    # Strong news organizations
+    high = [
         "reuters.com",
         "apnews.com",
         "bbc.com",
         "bbc.co.uk",
-    ]
-
-    for source in trusted:
-        if source in domain:
-            return 1.0
-
-    news = [
         "thehindu.com",
         "indianexpress.com",
         "ndtv.com",
-        "timesofindia.indiatimes.com",
-        "hindustantimes.com",
         "economictimes.indiatimes.com",
         "livemint.com",
+        "hindustantimes.com",
     ]
 
-    for source in news:
+    for source in high:
         if source in domain:
-            return 0.8
+            return "high"
 
-    return 0.55
-
-
-# ---------------------------------------------------------
-# NUMBER EXTRACTION
-# ---------------------------------------------------------
-
-def normalize_number(value):
-    try:
-        return float(value.replace(",", ""))
-    except:
-        return None
-
-
-def extract_numbers(text):
-    pattern = r"(?<!\w)(\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*)?(%|percent|percentage)?"
-
-    numbers = []
-
-    for match in re.finditer(pattern, text.lower()):
-        number = normalize_number(match.group(1))
-
-        if number is None:
-            continue
-
-        unit = match.group(2) or ""
-
-        numbers.append({
-            "value": number,
-            "unit": unit,
-            "start": match.start(),
-            "end": match.end()
-        })
-
-    return numbers
-
-
-def extract_years(text):
-    return [
-        int(x)
-        for x in re.findall(r"\b(19\d{2}|20\d{2})\b", text)
+    # Known but not authoritative
+    medium = [
+        "timesofindia.indiatimes.com",
+        "news18.com",
+        "moneycontrol.com",
+        "business-standard.com",
     ]
 
+    for source in medium:
+        if source in domain:
+            return "medium"
 
-# ---------------------------------------------------------
-# CLAIM VS EVIDENCE
-# ---------------------------------------------------------
-
-def token_set(text):
-    words = re.findall(r"[a-zA-Z]{3,}", text.lower())
-
-    stopwords = {
-        "the", "and", "was", "were", "has", "have",
-        "had", "for", "with", "that", "this", "from",
-        "into", "than", "about", "which", "their",
-        "there", "they", "them", "been", "also",
-        "are", "its", "but", "not", "you", "your",
-        "india", "according"
-    }
-
-    return set(x for x in words if x not in stopwords)
+    return "unknown"
 
 
-def text_overlap(claim, evidence):
-    a = token_set(claim)
-    b = token_set(evidence)
+# =========================================================
+# SERPER / GOOGLE SEARCH
+# =========================================================
 
-    if not a or not b:
-        return 0
-
-    return len(a & b) / len(a)
-
-
-def numeric_check(claim, evidence):
-    """
-    Returns:
-        +1  -> numerical evidence supports claim
-        -1  -> numerical evidence contradicts claim
-         0  -> inconclusive
-    """
-
-    claim_numbers = extract_numbers(claim)
-
-    if not claim_numbers:
-        return 0
-
-    evidence_numbers = extract_numbers(evidence)
-
-    if not evidence_numbers:
-        return 0
-
-    claim_years = extract_years(claim)
-    evidence_years = extract_years(evidence)
-
-    # If claim contains a year, evidence should ideally contain same year
-    same_year = False
-
-    if claim_years:
-        same_year = any(
-            year in evidence_years
-            for year in claim_years
-        )
-
-    # Compare numbers
-    for cn in claim_numbers:
-
-        # Ignore years
-        if 1900 <= cn["value"] <= 2100:
-            continue
-
-        for en in evidence_numbers:
-
-            if 1900 <= en["value"] <= 2100:
-                continue
-
-            # Same number -> supporting evidence
-            if abs(cn["value"] - en["value"]) < 0.01:
-                return 1
-
-    # Different number + same year -> contradiction
-    if same_year:
-
-        for cn in claim_numbers:
-
-            if 1900 <= cn["value"] <= 2100:
-                continue
-
-            for en in evidence_numbers:
-
-                if 1900 <= en["value"] <= 2100:
-                    continue
-
-                # Different meaningful number
-                difference = abs(cn["value"] - en["value"])
-
-                if difference > max(0.05, abs(cn["value"]) * 0.05):
-                    return -1
-
-    return 0
-
-
-# ---------------------------------------------------------
-# SEARCH
-# ---------------------------------------------------------
-
-def search(claim):
+def search_web(claim):
 
     if not SERPER_API_KEY:
-        return [{
-            "title": "Live search not configured",
-            "snippet": "Add SERPER_API_KEY to retrieve current web sources.",
-            "url": "https://serper.dev/",
-            "publisher": "TruthCheck",
-            "is_demo": True
-        }]
+        return []
 
-    try:
+    queries = [
+        claim,
+        f'"{claim}" fact check',
+    ]
 
-        # Search original claim
-        queries = [
-            claim,
-            claim + " fact check"
-        ]
+    results = []
+    seen = set()
 
-        results = []
+    for query in queries:
 
-        for query in queries:
+        try:
 
-            r = requests.post(
+            response = requests.post(
                 "https://google.serper.dev/search",
                 headers={
                     "X-API-KEY": SERPER_API_KEY,
@@ -306,186 +237,331 @@ def search(claim):
                 },
                 json={
                     "q": query,
-                    "num": 5
+                    "num": 8
                 },
-                timeout=12
+                timeout=15
             )
 
-            r.raise_for_status()
+            response.raise_for_status()
 
-            for x in r.json().get("organic", []):
+            data = response.json()
 
-                link = x.get("link", "")
+            for item in data.get("organic", []):
 
-                if not link:
+                url = item.get("link", "").strip()
+
+                if not url:
                     continue
 
+                if url in seen:
+                    continue
+
+                seen.add(url)
+
                 results.append({
-                    "title": x.get("title", "Untitled"),
-                    "snippet": x.get("snippet", ""),
-                    "url": link,
-                    "publisher": urlparse(link).netloc,
+                    "title": clean(
+                        item.get("title", "Untitled")
+                    ),
+                    "snippet": clean(
+                        item.get("snippet", "")
+                    ),
+                    "url": url,
+                    "publisher": urlparse(url).netloc,
+                    "source_quality": source_quality(url),
                     "is_demo": False
                 })
 
-        # Remove duplicates
-        unique = []
-        seen = set()
+        except Exception:
+            continue
 
-        for item in results:
-
-            if item["url"] in seen:
-                continue
-
-            seen.add(item["url"])
-            unique.append(item)
-
-        return unique[:8] or search_demo()
-
-    except Exception:
-        return search_demo()
+    return results[:12]
 
 
-def search_demo():
+# =========================================================
+# GEMINI
+# =========================================================
 
-    return [{
-        "title": "No live evidence available",
-        "snippet": "The search provider could not return live evidence.",
-        "url": "https://serper.dev/",
-        "publisher": "TruthCheck",
-        "is_demo": True
-    }]
+def gemini_request(prompt):
 
+    if not GEMINI_API_KEY:
+        return None
 
-# ---------------------------------------------------------
-# EVIDENCE ANALYSIS
-# ---------------------------------------------------------
-
-def analyze_evidence(claim, evidence):
-
-    if evidence.get("is_demo"):
-        return {
-            "status": "unknown",
-            "score": 0
-        }
-
-    combined_text = clean(
-        evidence.get("title", "") + " " +
-        evidence.get("snippet", "")
+    url = (
+        "https://generativelanguage.googleapis.com/"
+        f"v1beta/models/{GEMINI_MODEL}:generateContent"
+        f"?key={GEMINI_API_KEY}"
     )
 
-    overlap = text_overlap(claim, combined_text)
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {
+                        "text": prompt
+                    }
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.1,
+            "maxOutputTokens": 2000,
+            "responseMimeType": "application/json"
+        }
+    }
 
-    number_result = numeric_check(claim, combined_text)
+    try:
 
-    reliability = source_reliability(evidence["url"])
+        response = requests.post(
+            url,
+            headers={
+                "Content-Type": "application/json"
+            },
+            json=payload,
+            timeout=30
+        )
 
-    # Strong numerical contradiction
-    if number_result == -1 and overlap >= 0.25:
+        response.raise_for_status()
+
+        data = response.json()
+
+        candidates = data.get(
+            "candidates",
+            []
+        )
+
+        if not candidates:
+            return None
+
+        parts = (
+            candidates[0]
+            .get("content", {})
+            .get("parts", [])
+        )
+
+        if not parts:
+            return None
+
+        output = parts[0].get(
+            "text",
+            ""
+        ).strip()
+
+        if not output:
+            return None
+
+        # Remove accidental markdown fences
+        output = re.sub(
+            r"^```json\s*",
+            "",
+            output,
+            flags=re.IGNORECASE
+        )
+
+        output = re.sub(
+            r"\s*```$",
+            "",
+            output
+        )
+
+        return json.loads(output)
+
+    except Exception:
+        return None
+
+
+# =========================================================
+# CLAIM FACT CHECK
+# =========================================================
+
+def fact_check_claim(claim, evidence):
+
+    if not evidence:
+
         return {
-            "status": "contradicts",
-            "score": -45 * reliability
+            "score": 50,
+            "verdict": "UNCERTAIN",
+            "reason": (
+                "No reliable web evidence was found "
+                "for this claim."
+            ),
+            "confidence": 20,
+            "key_evidence": []
         }
 
-    # Numerical support
-    if number_result == 1 and overlap >= 0.20:
+    evidence_text = []
+
+    for i, item in enumerate(evidence, 1):
+
+        evidence_text.append(
+            f"""
+SOURCE {i}
+Title: {item['title']}
+Publisher: {item['publisher']}
+Source quality: {item['source_quality']}
+URL: {item['url']}
+Snippet: {item['snippet']}
+"""
+        )
+
+    evidence_block = "\n".join(evidence_text)
+
+    prompt = f"""
+You are the fact-checking engine of a news verification website.
+
+Your task is to determine whether the USER CLAIM is supported,
+contradicted, or uncertain based ONLY on the provided web evidence.
+
+USER CLAIM:
+{claim}
+
+WEB EVIDENCE:
+{evidence_block}
+
+IMPORTANT RULES:
+
+1. Do NOT assume the user's claim is true.
+
+2. Do NOT decide that a claim is true simply because Google
+   returned search results.
+
+3. Compare the actual meaning of the claim with the evidence.
+
+4. Carefully check:
+   - numbers
+   - percentages
+   - dates
+   - years
+   - names
+   - locations
+   - quantities
+   - cause/effect statements
+   - "before/after" statements
+
+5. A source that merely discusses the same topic is NOT proof
+   that the claim is true.
+
+6. Prefer high-quality sources:
+   government, official institutions, World Bank, IMF, WHO,
+   RBI, research organizations, Reuters, AP, BBC and other
+   established sources.
+
+7. If multiple reliable sources agree, confidence should increase.
+
+8. If reliable sources directly contradict the claim,
+   the claim should be CONTRADICTED.
+
+9. If evidence is incomplete or ambiguous, use UNCERTAIN.
+
+10. Never invent facts.
+
+11. Never invent a source.
+
+12. Do not use your own memory when the supplied evidence
+    can answer the question.
+
+13. If sources disagree, mention the disagreement.
+
+14. Do NOT give 80-90% merely because many search results
+    exist.
+
+15. The score represents how strongly the available evidence
+    supports the claim:
+       90-100 = very strong support
+       75-89  = strong support
+       55-74  = moderate / mixed support
+       35-54  = weak / uncertain
+       0-34   = strong contradiction
+
+16. If the evidence directly contradicts an important numerical
+    or factual part of the claim, score should normally be below 35.
+
+17. If there is not enough evidence to decide, keep the score
+    around 45-55 rather than guessing.
+
+Return ONLY valid JSON:
+
+{{
+    "score": integer between 0 and 100,
+    "verdict": "SUPPORTED" or "CONTRADICTED" or "UNCERTAIN",
+    "reason": "short explanation of why",
+    "confidence": integer between 0 and 100,
+    "key_evidence": [
+        {{
+            "source_number": integer,
+            "finding": "short explanation"
+        }}
+    ]
+}}
+"""
+
+    result = gemini_request(prompt)
+
+    if not result:
         return {
-            "status": "supports",
-            "score": 35 * reliability
+            "score": 50,
+            "verdict": "UNCERTAIN",
+            "reason": (
+                "AI verification could not be completed. "
+                "Please verify using the listed sources."
+            ),
+            "confidence": 0,
+            "key_evidence": []
         }
 
-    # General textual support
-    if overlap >= 0.55:
-        return {
-            "status": "supports",
-            "score": 25 * reliability
-        }
+    # Safety / validation
+    try:
+        score = int(result.get("score", 50))
+    except Exception:
+        score = 50
 
-    if overlap >= 0.30:
-        return {
-            "status": "related",
-            "score": 8 * reliability
-        }
+    score = max(0, min(100, score))
+
+    verdict_value = str(
+        result.get("verdict", "UNCERTAIN")
+    ).upper()
+
+    if verdict_value not in [
+        "SUPPORTED",
+        "CONTRADICTED",
+        "UNCERTAIN"
+    ]:
+        verdict_value = "UNCERTAIN"
 
     return {
-        "status": "unknown",
-        "score": 0
+        "score": score,
+        "verdict": verdict_value,
+        "reason": clean(
+            str(
+                result.get(
+                    "reason",
+                    "Insufficient evidence."
+                )
+            )
+        ),
+        "confidence": max(
+            0,
+            min(
+                100,
+                int(
+                    result.get(
+                        "confidence",
+                        50
+                    )
+                )
+            )
+        ),
+        "key_evidence": result.get(
+            "key_evidence",
+            []
+        )
     }
 
 
-# ---------------------------------------------------------
-# CLAIM SCORE
-# ---------------------------------------------------------
+# =========================================================
+# OVERALL VERDICT
+# =========================================================
 
-def calculate_claim_score(claim, evidence):
-
-    if not evidence:
-        return 50, "Insufficient evidence"
-
-    scores = []
-
-    support_count = 0
-    contradiction_count = 0
-
-    for item in evidence:
-
-        analysis = analyze_evidence(claim, item)
-
-        scores.append(analysis["score"])
-
-        if analysis["status"] == "supports":
-            support_count += 1
-
-        elif analysis["status"] == "contradicts":
-            contradiction_count += 1
-
-    if not scores:
-        return 50, "Insufficient evidence"
-
-    # Start from neutral
-    score = 50
-
-    positive = sum(x for x in scores if x > 0)
-    negative = sum(x for x in scores if x < 0)
-
-    # Add supporting evidence
-    score += min(35, positive)
-
-    # Subtract contradictory evidence
-    score += max(-45, negative)
-
-    score = max(5, min(95, round(score)))
-
-    if contradiction_count > support_count:
-        verdict = "Likely false / contradicted"
-
-    elif support_count > contradiction_count:
-        verdict = "Mostly supported"
-
-    else:
-        verdict = "Mixed / needs verification"
-
-    return score, verdict
-
-
-# ---------------------------------------------------------
-# OVERALL SCORE
-# ---------------------------------------------------------
-
-def overall_score(claim_results):
-
-    if not claim_results:
-        return 50
-
-    scores = [
-        x["support"]
-        for x in claim_results
-    ]
-
-    return round(sum(scores) / len(scores))
-
-
-def verdict(score):
+def overall_verdict(score):
 
     if score >= 85:
         return "Strongly supported"
@@ -502,23 +578,9 @@ def verdict(score):
     return "Strongly contradicted"
 
 
-# ---------------------------------------------------------
-# ROUTES
-# ---------------------------------------------------------
-
-@app.get("/")
-def home():
-    return FileResponse(
-        os.path.join(FRONTEND, "index.html")
-    )
-
-
-@app.get("/health")
-def health():
-    return {
-        "status": "ok"
-    }
-
+# =========================================================
+# ANALYZE
+# =========================================================
 
 @app.post("/api/analyze")
 def analyze(req: AnalyzeRequest):
@@ -526,12 +588,17 @@ def analyze(req: AnalyzeRequest):
     text = clean(req.text)
     source_title = ""
 
-    # URL input
+    # ---------------------------------------------
+    # URL MODE
+    # ---------------------------------------------
+
     if req.url.strip():
 
         url = clean(req.url)
 
-        if not url.startswith(("http://", "https://")):
+        if not url.startswith(
+            ("http://", "https://")
+        ):
             raise HTTPException(
                 400,
                 "Please enter a valid URL."
@@ -540,67 +607,3255 @@ def analyze(req: AnalyzeRequest):
         source_title, text = extract_article(url)
 
     if len(text) < 20:
+
         raise HTTPException(
             400,
             "Please provide a paragraph or article URL."
         )
 
+    # ---------------------------------------------
+    # CLAIMS
+    # ---------------------------------------------
+
     claims = claims_from(text)
 
-    all_evidence = []
     results = []
+    all_sources = []
+
+    # ---------------------------------------------
+    # FACT CHECK EACH CLAIM
+    # ---------------------------------------------
 
     for claim in claims:
 
-        evidence = search(claim)
+        evidence = search_web(claim)
 
-        all_evidence.extend(evidence)
-
-        claim_score, claim_verdict = calculate_claim_score(
+        verification = fact_check_claim(
             claim,
             evidence
         )
 
         results.append({
             "claim": claim,
-            "support": claim_score,
-            "verdict": claim_verdict,
+            "support": verification["score"],
+            "verdict": verification["verdict"],
+            "reason": verification["reason"],
+            "confidence": verification["confidence"],
             "evidence": evidence
         })
 
-    # Related information
-    seen = set()
+        all_sources.extend(evidence)
+
+    # ---------------------------------------------
+    # OVERALL SCORE
+    # ---------------------------------------------
+
+    if results:
+
+        weighted_scores = []
+
+        for result in results:
+
+            # Confidence slightly affects the final score,
+            # but never dominates the AI judgement.
+            score = result["support"]
+            confidence = result["confidence"]
+
+            weight = 0.75 + (
+                confidence / 100
+            ) * 0.25
+
+            weighted_scores.append(
+                score * weight
+            )
+
+        final_score = round(
+            sum(weighted_scores)
+            / sum(
+                0.75 + (
+                    r["confidence"] / 100
+                ) * 0.25
+                for r in results
+            )
+        )
+
+    else:
+        final_score = 50
+
+    # ---------------------------------------------
+    # RELATED SOURCES
+    # ---------------------------------------------
+
     related = []
+    seen = set()
 
-    for evidence in all_evidence:
+    # First prefer reliable sources
+    priority_order = {
+        "very_high": 0,
+        "high": 1,
+        "medium": 2,
+        "unknown": 3
+    }
 
-        if evidence.get("is_demo"):
+    all_sources.sort(
+        key=lambda x: priority_order.get(
+            x.get("source_quality", "unknown"),
+            3
+        )
+    )
+
+    for source in all_sources:
+
+        url = source.get("url", "")
+
+        if not url:
             continue
 
-        url = evidence.get("url", "")
-
-        if not url or url in seen:
+        if url in seen:
             continue
 
         seen.add(url)
 
-        related.append(evidence)
+        related.append(source)
 
-        if len(related) >= 8:
+        if len(related) >= 10:
             break
-
-    final_score = overall_score(results)
 
     return {
         "truth_score": final_score,
-        "verdict": verdict(final_score),
+        "verdict": overall_verdict(
+            final_score
+        ),
         "source_title": source_title,
         "claims_analyzed": len(claims),
         "claims": results,
         "related_information": related,
-        "demo_mode": not bool(SERPER_API_KEY),
+        "demo_mode": not bool(
+            SERPER_API_KEY
+        ),
+        "ai_mode": bool(
+            GEMINI_API_KEY
+        ),
         "disclaimer": (
-            "This score is an evidence-based estimate, "
-            "not a guarantee of truth."
+            "This is an evidence-based AI estimate, "
+            "not a guarantee of truth. Always inspect "
+            "the cited sources for important claims."
+        )
+    }
+
+
+# =========================================================
+# BASIC ROUTES
+# =========================================================
+
+@app.get("/")
+def home():
+
+    return FileResponse(
+        os.path.join(
+            FRONTEND,
+            "index.html"
+        )
+    )
+
+
+@app.get("/health")
+def health():
+
+    return {
+        "status": "ok",
+        "serper_configured": bool(
+            SERPER_API_KEY
+        ),
+        "gemini_configured": bool(
+            GEMINI_API_KEY
+        )
+    }import os
+import re
+import json
+from urllib.parse import urlparse
+
+import requests
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+
+load_dotenv()
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+FRONTEND = BASE
+
+SERPER_API_KEY = os.getenv("SERPER_API_KEY", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+
+GEMINI_MODEL = "gemini-3.8-flash"
+
+app = FastAPI(
+    title="TruthCheck API",
+    version="3.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.mount(
+    "/static",
+    StaticFiles(directory=FRONTEND),
+    name="static"
+)
+
+
+class AnalyzeRequest(BaseModel):
+    text: str = Field("", max_length=50000)
+    url: str = Field("", max_length=2000)
+
+
+# =========================================================
+# BASIC HELPERS
+# =========================================================
+
+def clean(text):
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def extract_article(url):
+    try:
+        response = requests.get(
+            url,
+            timeout=15,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 "
+                    "(Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 "
+                    "Chrome/120 Safari/537.36"
+                )
+            }
+        )
+
+        response.raise_for_status()
+
+        soup = BeautifulSoup(
+            response.text,
+            "html.parser"
+        )
+
+        for tag in soup([
+            "script",
+            "style",
+            "noscript",
+            "nav",
+            "footer",
+            "header",
+            "aside"
+        ]):
+            tag.decompose()
+
+        title = (
+            soup.title.get_text(" ", strip=True)
+            if soup.title
+            else url
+        )
+
+        paragraphs = []
+
+        for p in soup.find_all("p"):
+            text = clean(p.get_text(" ", strip=True))
+
+            if len(text) >= 30:
+                paragraphs.append(text)
+
+        body = clean(" ".join(paragraphs))
+
+        if len(body) < 100:
+            body = clean(
+                soup.get_text(" ", strip=True)
+            )
+
+        return title, body[:50000]
+
+    except Exception as e:
+        raise HTTPException(
+            400,
+            f"Could not read article URL: {e}"
+        )
+
+
+# =========================================================
+# CLAIM EXTRACTION
+# =========================================================
+
+def claims_from(text):
+
+    text = clean(text)
+
+    parts = re.split(
+        r"(?<=[.!?])\s+",
+        text
+    )
+
+    claims = []
+
+    for part in parts:
+
+        part = part.strip()
+
+        if 25 <= len(part) <= 700:
+            claims.append(part)
+
+    if not claims:
+        return [text[:700]]
+
+    return claims[:10]
+
+
+# =========================================================
+# SOURCE QUALITY
+# =========================================================
+
+def source_quality(url):
+
+    domain = urlparse(url).netloc.lower()
+
+    # Extremely strong sources
+    very_high = [
+        ".gov",
+        ".gov.in",
+        ".nic.in",
+        "worldbank.org",
+        "imf.org",
+        "who.int",
+        "un.org",
+        "unicef.org",
+        "rbi.org.in",
+        "nasa.gov",
+        "isro.gov.in",
+        "oecd.org",
+        "ec.europa.eu",
+    ]
+
+    for source in very_high:
+        if source in domain:
+            return "very_high"
+
+    # Strong news organizations
+    high = [
+        "reuters.com",
+        "apnews.com",
+        "bbc.com",
+        "bbc.co.uk",
+        "thehindu.com",
+        "indianexpress.com",
+        "ndtv.com",
+        "economictimes.indiatimes.com",
+        "livemint.com",
+        "hindustantimes.com",
+    ]
+
+    for source in high:
+        if source in domain:
+            return "high"
+
+    # Known but not authoritative
+    medium = [
+        "timesofindia.indiatimes.com",
+        "news18.com",
+        "moneycontrol.com",
+        "business-standard.com",
+    ]
+
+    for source in medium:
+        if source in domain:
+            return "medium"
+
+    return "unknown"
+
+
+# =========================================================
+# SERPER / GOOGLE SEARCH
+# =========================================================
+
+def search_web(claim):
+
+    if not SERPER_API_KEY:
+        return []
+
+    queries = [
+        claim,
+        f'"{claim}" fact check',
+    ]
+
+    results = []
+    seen = set()
+
+    for query in queries:
+
+        try:
+
+            response = requests.post(
+                "https://google.serper.dev/search",
+                headers={
+                    "X-API-KEY": SERPER_API_KEY,
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "q": query,
+                    "num": 8
+                },
+                timeout=15
+            )
+
+            response.raise_for_status()
+
+            data = response.json()
+
+            for item in data.get("organic", []):
+
+                url = item.get("link", "").strip()
+
+                if not url:
+                    continue
+
+                if url in seen:
+                    continue
+
+                seen.add(url)
+
+                results.append({
+                    "title": clean(
+                        item.get("title", "Untitled")
+                    ),
+                    "snippet": clean(
+                        item.get("snippet", "")
+                    ),
+                    "url": url,
+                    "publisher": urlparse(url).netloc,
+                    "source_quality": source_quality(url),
+                    "is_demo": False
+                })
+
+        except Exception:
+            continue
+
+    return results[:12]
+
+
+# =========================================================
+# GEMINI
+# =========================================================
+
+def gemini_request(prompt):
+
+    if not GEMINI_API_KEY:
+        return None
+
+    url = (
+        "https://generativelanguage.googleapis.com/"
+        f"v1beta/models/{GEMINI_MODEL}:generateContent"
+        f"?key={GEMINI_API_KEY}"
+    )
+
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {
+                        "text": prompt
+                    }
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.1,
+            "maxOutputTokens": 2000,
+            "responseMimeType": "application/json"
+        }
+    }
+
+    try:
+
+        response = requests.post(
+            url,
+            headers={
+                "Content-Type": "application/json"
+            },
+            json=payload,
+            timeout=30
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        candidates = data.get(
+            "candidates",
+            []
+        )
+
+        if not candidates:
+            return None
+
+        parts = (
+            candidates[0]
+            .get("content", {})
+            .get("parts", [])
+        )
+
+        if not parts:
+            return None
+
+        output = parts[0].get(
+            "text",
+            ""
+        ).strip()
+
+        if not output:
+            return None
+
+        # Remove accidental markdown fences
+        output = re.sub(
+            r"^```json\s*",
+            "",
+            output,
+            flags=re.IGNORECASE
+        )
+
+        output = re.sub(
+            r"\s*```$",
+            "",
+            output
+        )
+
+        return json.loads(output)
+
+    except Exception:
+        return None
+
+
+# =========================================================
+# CLAIM FACT CHECK
+# =========================================================
+
+def fact_check_claim(claim, evidence):
+
+    if not evidence:
+
+        return {
+            "score": 50,
+            "verdict": "UNCERTAIN",
+            "reason": (
+                "No reliable web evidence was found "
+                "for this claim."
+            ),
+            "confidence": 20,
+            "key_evidence": []
+        }
+
+    evidence_text = []
+
+    for i, item in enumerate(evidence, 1):
+
+        evidence_text.append(
+            f"""
+SOURCE {i}
+Title: {item['title']}
+Publisher: {item['publisher']}
+Source quality: {item['source_quality']}
+URL: {item['url']}
+Snippet: {item['snippet']}
+"""
+        )
+
+    evidence_block = "\n".join(evidence_text)
+
+    prompt = f"""
+You are the fact-checking engine of a news verification website.
+
+Your task is to determine whether the USER CLAIM is supported,
+contradicted, or uncertain based ONLY on the provided web evidence.
+
+USER CLAIM:
+{claim}
+
+WEB EVIDENCE:
+{evidence_block}
+
+IMPORTANT RULES:
+
+1. Do NOT assume the user's claim is true.
+
+2. Do NOT decide that a claim is true simply because Google
+   returned search results.
+
+3. Compare the actual meaning of the claim with the evidence.
+
+4. Carefully check:
+   - numbers
+   - percentages
+   - dates
+   - years
+   - names
+   - locations
+   - quantities
+   - cause/effect statements
+   - "before/after" statements
+
+5. A source that merely discusses the same topic is NOT proof
+   that the claim is true.
+
+6. Prefer high-quality sources:
+   government, official institutions, World Bank, IMF, WHO,
+   RBI, research organizations, Reuters, AP, BBC and other
+   established sources.
+
+7. If multiple reliable sources agree, confidence should increase.
+
+8. If reliable sources directly contradict the claim,
+   the claim should be CONTRADICTED.
+
+9. If evidence is incomplete or ambiguous, use UNCERTAIN.
+
+10. Never invent facts.
+
+11. Never invent a source.
+
+12. Do not use your own memory when the supplied evidence
+    can answer the question.
+
+13. If sources disagree, mention the disagreement.
+
+14. Do NOT give 80-90% merely because many search results
+    exist.
+
+15. The score represents how strongly the available evidence
+    supports the claim:
+       90-100 = very strong support
+       75-89  = strong support
+       55-74  = moderate / mixed support
+       35-54  = weak / uncertain
+       0-34   = strong contradiction
+
+16. If the evidence directly contradicts an important numerical
+    or factual part of the claim, score should normally be below 35.
+
+17. If there is not enough evidence to decide, keep the score
+    around 45-55 rather than guessing.
+
+Return ONLY valid JSON:
+
+{{
+    "score": integer between 0 and 100,
+    "verdict": "SUPPORTED" or "CONTRADICTED" or "UNCERTAIN",
+    "reason": "short explanation of why",
+    "confidence": integer between 0 and 100,
+    "key_evidence": [
+        {{
+            "source_number": integer,
+            "finding": "short explanation"
+        }}
+    ]
+}}
+"""
+
+    result = gemini_request(prompt)
+
+    if not result:
+        return {
+            "score": 50,
+            "verdict": "UNCERTAIN",
+            "reason": (
+                "AI verification could not be completed. "
+                "Please verify using the listed sources."
+            ),
+            "confidence": 0,
+            "key_evidence": []
+        }
+
+    # Safety / validation
+    try:
+        score = int(result.get("score", 50))
+    except Exception:
+        score = 50
+
+    score = max(0, min(100, score))
+
+    verdict_value = str(
+        result.get("verdict", "UNCERTAIN")
+    ).upper()
+
+    if verdict_value not in [
+        "SUPPORTED",
+        "CONTRADICTED",
+        "UNCERTAIN"
+    ]:
+        verdict_value = "UNCERTAIN"
+
+    return {
+        "score": score,
+        "verdict": verdict_value,
+        "reason": clean(
+            str(
+                result.get(
+                    "reason",
+                    "Insufficient evidence."
+                )
+            )
+        ),
+        "confidence": max(
+            0,
+            min(
+                100,
+                int(
+                    result.get(
+                        "confidence",
+                        50
+                    )
+                )
+            )
+        ),
+        "key_evidence": result.get(
+            "key_evidence",
+            []
+        )
+    }
+
+
+# =========================================================
+# OVERALL VERDICT
+# =========================================================
+
+def overall_verdict(score):
+
+    if score >= 85:
+        return "Strongly supported"
+
+    if score >= 70:
+        return "Mostly supported"
+
+    if score >= 55:
+        return "Mixed / needs verification"
+
+    if score >= 35:
+        return "Likely false / weak evidence"
+
+    return "Strongly contradicted"
+
+
+# =========================================================
+# ANALYZE
+# =========================================================
+
+@app.post("/api/analyze")
+def analyze(req: AnalyzeRequest):
+
+    text = clean(req.text)
+    source_title = ""
+
+    # ---------------------------------------------
+    # URL MODE
+    # ---------------------------------------------
+
+    if req.url.strip():
+
+        url = clean(req.url)
+
+        if not url.startswith(
+            ("http://", "https://")
+        ):
+            raise HTTPException(
+                400,
+                "Please enter a valid URL."
+            )
+
+        source_title, text = extract_article(url)
+
+    if len(text) < 20:
+
+        raise HTTPException(
+            400,
+            "Please provide a paragraph or article URL."
+        )
+
+    # ---------------------------------------------
+    # CLAIMS
+    # ---------------------------------------------
+
+    claims = claims_from(text)
+
+    results = []
+    all_sources = []
+
+    # ---------------------------------------------
+    # FACT CHECK EACH CLAIM
+    # ---------------------------------------------
+
+    for claim in claims:
+
+        evidence = search_web(claim)
+
+        verification = fact_check_claim(
+            claim,
+            evidence
+        )
+
+        results.append({
+            "claim": claim,
+            "support": verification["score"],
+            "verdict": verification["verdict"],
+            "reason": verification["reason"],
+            "confidence": verification["confidence"],
+            "evidence": evidence
+        })
+
+        all_sources.extend(evidence)
+
+    # ---------------------------------------------
+    # OVERALL SCORE
+    # ---------------------------------------------
+
+    if results:
+
+        weighted_scores = []
+
+        for result in results:
+
+            # Confidence slightly affects the final score,
+            # but never dominates the AI judgement.
+            score = result["support"]
+            confidence = result["confidence"]
+
+            weight = 0.75 + (
+                confidence / 100
+            ) * 0.25
+
+            weighted_scores.append(
+                score * weight
+            )
+
+        final_score = round(
+            sum(weighted_scores)
+            / sum(
+                0.75 + (
+                    r["confidence"] / 100
+                ) * 0.25
+                for r in results
+            )
+        )
+
+    else:
+        final_score = 50
+
+    # ---------------------------------------------
+    # RELATED SOURCES
+    # ---------------------------------------------
+
+    related = []
+    seen = set()
+
+    # First prefer reliable sources
+    priority_order = {
+        "very_high": 0,
+        "high": 1,
+        "medium": 2,
+        "unknown": 3
+    }
+
+    all_sources.sort(
+        key=lambda x: priority_order.get(
+            x.get("source_quality", "unknown"),
+            3
+        )
+    )
+
+    for source in all_sources:
+
+        url = source.get("url", "")
+
+        if not url:
+            continue
+
+        if url in seen:
+            continue
+
+        seen.add(url)
+
+        related.append(source)
+
+        if len(related) >= 10:
+            break
+
+    return {
+        "truth_score": final_score,
+        "verdict": overall_verdict(
+            final_score
+        ),
+        "source_title": source_title,
+        "claims_analyzed": len(claims),
+        "claims": results,
+        "related_information": related,
+        "demo_mode": not bool(
+            SERPER_API_KEY
+        ),
+        "ai_mode": bool(
+            GEMINI_API_KEY
+        ),
+        "disclaimer": (
+            "This is an evidence-based AI estimate, "
+            "not a guarantee of truth. Always inspect "
+            "the cited sources for important claims."
+        )
+    }
+
+
+# =========================================================
+# BASIC ROUTES
+# =========================================================
+
+@app.get("/")
+def home():
+
+    return FileResponse(
+        os.path.join(
+            FRONTEND,
+            "index.html"
+        )
+    )
+
+
+@app.get("/health")
+def health():
+
+    return {
+        "status": "ok",
+        "serper_configured": bool(
+            SERPER_API_KEY
+        ),
+        "gemini_configured": bool(
+            GEMINI_API_KEY
+        )
+    }import os
+import re
+import json
+from urllib.parse import urlparse
+
+import requests
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+
+load_dotenv()
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+FRONTEND = BASE
+
+SERPER_API_KEY = os.getenv("SERPER_API_KEY", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+
+GEMINI_MODEL = "gemini-3.8-flash"
+
+app = FastAPI(
+    title="TruthCheck API",
+    version="3.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.mount(
+    "/static",
+    StaticFiles(directory=FRONTEND),
+    name="static"
+)
+
+
+class AnalyzeRequest(BaseModel):
+    text: str = Field("", max_length=50000)
+    url: str = Field("", max_length=2000)
+
+
+# =========================================================
+# BASIC HELPERS
+# =========================================================
+
+def clean(text):
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def extract_article(url):
+    try:
+        response = requests.get(
+            url,
+            timeout=15,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 "
+                    "(Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 "
+                    "Chrome/120 Safari/537.36"
+                )
+            }
+        )
+
+        response.raise_for_status()
+
+        soup = BeautifulSoup(
+            response.text,
+            "html.parser"
+        )
+
+        for tag in soup([
+            "script",
+            "style",
+            "noscript",
+            "nav",
+            "footer",
+            "header",
+            "aside"
+        ]):
+            tag.decompose()
+
+        title = (
+            soup.title.get_text(" ", strip=True)
+            if soup.title
+            else url
+        )
+
+        paragraphs = []
+
+        for p in soup.find_all("p"):
+            text = clean(p.get_text(" ", strip=True))
+
+            if len(text) >= 30:
+                paragraphs.append(text)
+
+        body = clean(" ".join(paragraphs))
+
+        if len(body) < 100:
+            body = clean(
+                soup.get_text(" ", strip=True)
+            )
+
+        return title, body[:50000]
+
+    except Exception as e:
+        raise HTTPException(
+            400,
+            f"Could not read article URL: {e}"
+        )
+
+
+# =========================================================
+# CLAIM EXTRACTION
+# =========================================================
+
+def claims_from(text):
+
+    text = clean(text)
+
+    parts = re.split(
+        r"(?<=[.!?])\s+",
+        text
+    )
+
+    claims = []
+
+    for part in parts:
+
+        part = part.strip()
+
+        if 25 <= len(part) <= 700:
+            claims.append(part)
+
+    if not claims:
+        return [text[:700]]
+
+    return claims[:10]
+
+
+# =========================================================
+# SOURCE QUALITY
+# =========================================================
+
+def source_quality(url):
+
+    domain = urlparse(url).netloc.lower()
+
+    # Extremely strong sources
+    very_high = [
+        ".gov",
+        ".gov.in",
+        ".nic.in",
+        "worldbank.org",
+        "imf.org",
+        "who.int",
+        "un.org",
+        "unicef.org",
+        "rbi.org.in",
+        "nasa.gov",
+        "isro.gov.in",
+        "oecd.org",
+        "ec.europa.eu",
+    ]
+
+    for source in very_high:
+        if source in domain:
+            return "very_high"
+
+    # Strong news organizations
+    high = [
+        "reuters.com",
+        "apnews.com",
+        "bbc.com",
+        "bbc.co.uk",
+        "thehindu.com",
+        "indianexpress.com",
+        "ndtv.com",
+        "economictimes.indiatimes.com",
+        "livemint.com",
+        "hindustantimes.com",
+    ]
+
+    for source in high:
+        if source in domain:
+            return "high"
+
+    # Known but not authoritative
+    medium = [
+        "timesofindia.indiatimes.com",
+        "news18.com",
+        "moneycontrol.com",
+        "business-standard.com",
+    ]
+
+    for source in medium:
+        if source in domain:
+            return "medium"
+
+    return "unknown"
+
+
+# =========================================================
+# SERPER / GOOGLE SEARCH
+# =========================================================
+
+def search_web(claim):
+
+    if not SERPER_API_KEY:
+        return []
+
+    queries = [
+        claim,
+        f'"{claim}" fact check',
+    ]
+
+    results = []
+    seen = set()
+
+    for query in queries:
+
+        try:
+
+            response = requests.post(
+                "https://google.serper.dev/search",
+                headers={
+                    "X-API-KEY": SERPER_API_KEY,
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "q": query,
+                    "num": 8
+                },
+                timeout=15
+            )
+
+            response.raise_for_status()
+
+            data = response.json()
+
+            for item in data.get("organic", []):
+
+                url = item.get("link", "").strip()
+
+                if not url:
+                    continue
+
+                if url in seen:
+                    continue
+
+                seen.add(url)
+
+                results.append({
+                    "title": clean(
+                        item.get("title", "Untitled")
+                    ),
+                    "snippet": clean(
+                        item.get("snippet", "")
+                    ),
+                    "url": url,
+                    "publisher": urlparse(url).netloc,
+                    "source_quality": source_quality(url),
+                    "is_demo": False
+                })
+
+        except Exception:
+            continue
+
+    return results[:12]
+
+
+# =========================================================
+# GEMINI
+# =========================================================
+
+def gemini_request(prompt):
+
+    if not GEMINI_API_KEY:
+        return None
+
+    url = (
+        "https://generativelanguage.googleapis.com/"
+        f"v1beta/models/{GEMINI_MODEL}:generateContent"
+        f"?key={GEMINI_API_KEY}"
+    )
+
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {
+                        "text": prompt
+                    }
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.1,
+            "maxOutputTokens": 2000,
+            "responseMimeType": "application/json"
+        }
+    }
+
+    try:
+
+        response = requests.post(
+            url,
+            headers={
+                "Content-Type": "application/json"
+            },
+            json=payload,
+            timeout=30
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        candidates = data.get(
+            "candidates",
+            []
+        )
+
+        if not candidates:
+            return None
+
+        parts = (
+            candidates[0]
+            .get("content", {})
+            .get("parts", [])
+        )
+
+        if not parts:
+            return None
+
+        output = parts[0].get(
+            "text",
+            ""
+        ).strip()
+
+        if not output:
+            return None
+
+        # Remove accidental markdown fences
+        output = re.sub(
+            r"^```json\s*",
+            "",
+            output,
+            flags=re.IGNORECASE
+        )
+
+        output = re.sub(
+            r"\s*```$",
+            "",
+            output
+        )
+
+        return json.loads(output)
+
+    except Exception:
+        return None
+
+
+# =========================================================
+# CLAIM FACT CHECK
+# =========================================================
+
+def fact_check_claim(claim, evidence):
+
+    if not evidence:
+
+        return {
+            "score": 50,
+            "verdict": "UNCERTAIN",
+            "reason": (
+                "No reliable web evidence was found "
+                "for this claim."
+            ),
+            "confidence": 20,
+            "key_evidence": []
+        }
+
+    evidence_text = []
+
+    for i, item in enumerate(evidence, 1):
+
+        evidence_text.append(
+            f"""
+SOURCE {i}
+Title: {item['title']}
+Publisher: {item['publisher']}
+Source quality: {item['source_quality']}
+URL: {item['url']}
+Snippet: {item['snippet']}
+"""
+        )
+
+    evidence_block = "\n".join(evidence_text)
+
+    prompt = f"""
+You are the fact-checking engine of a news verification website.
+
+Your task is to determine whether the USER CLAIM is supported,
+contradicted, or uncertain based ONLY on the provided web evidence.
+
+USER CLAIM:
+{claim}
+
+WEB EVIDENCE:
+{evidence_block}
+
+IMPORTANT RULES:
+
+1. Do NOT assume the user's claim is true.
+
+2. Do NOT decide that a claim is true simply because Google
+   returned search results.
+
+3. Compare the actual meaning of the claim with the evidence.
+
+4. Carefully check:
+   - numbers
+   - percentages
+   - dates
+   - years
+   - names
+   - locations
+   - quantities
+   - cause/effect statements
+   - "before/after" statements
+
+5. A source that merely discusses the same topic is NOT proof
+   that the claim is true.
+
+6. Prefer high-quality sources:
+   government, official institutions, World Bank, IMF, WHO,
+   RBI, research organizations, Reuters, AP, BBC and other
+   established sources.
+
+7. If multiple reliable sources agree, confidence should increase.
+
+8. If reliable sources directly contradict the claim,
+   the claim should be CONTRADICTED.
+
+9. If evidence is incomplete or ambiguous, use UNCERTAIN.
+
+10. Never invent facts.
+
+11. Never invent a source.
+
+12. Do not use your own memory when the supplied evidence
+    can answer the question.
+
+13. If sources disagree, mention the disagreement.
+
+14. Do NOT give 80-90% merely because many search results
+    exist.
+
+15. The score represents how strongly the available evidence
+    supports the claim:
+       90-100 = very strong support
+       75-89  = strong support
+       55-74  = moderate / mixed support
+       35-54  = weak / uncertain
+       0-34   = strong contradiction
+
+16. If the evidence directly contradicts an important numerical
+    or factual part of the claim, score should normally be below 35.
+
+17. If there is not enough evidence to decide, keep the score
+    around 45-55 rather than guessing.
+
+Return ONLY valid JSON:
+
+{{
+    "score": integer between 0 and 100,
+    "verdict": "SUPPORTED" or "CONTRADICTED" or "UNCERTAIN",
+    "reason": "short explanation of why",
+    "confidence": integer between 0 and 100,
+    "key_evidence": [
+        {{
+            "source_number": integer,
+            "finding": "short explanation"
+        }}
+    ]
+}}
+"""
+
+    result = gemini_request(prompt)
+
+    if not result:
+        return {
+            "score": 50,
+            "verdict": "UNCERTAIN",
+            "reason": (
+                "AI verification could not be completed. "
+                "Please verify using the listed sources."
+            ),
+            "confidence": 0,
+            "key_evidence": []
+        }
+
+    # Safety / validation
+    try:
+        score = int(result.get("score", 50))
+    except Exception:
+        score = 50
+
+    score = max(0, min(100, score))
+
+    verdict_value = str(
+        result.get("verdict", "UNCERTAIN")
+    ).upper()
+
+    if verdict_value not in [
+        "SUPPORTED",
+        "CONTRADICTED",
+        "UNCERTAIN"
+    ]:
+        verdict_value = "UNCERTAIN"
+
+    return {
+        "score": score,
+        "verdict": verdict_value,
+        "reason": clean(
+            str(
+                result.get(
+                    "reason",
+                    "Insufficient evidence."
+                )
+            )
+        ),
+        "confidence": max(
+            0,
+            min(
+                100,
+                int(
+                    result.get(
+                        "confidence",
+                        50
+                    )
+                )
+            )
+        ),
+        "key_evidence": result.get(
+            "key_evidence",
+            []
+        )
+    }
+
+
+# =========================================================
+# OVERALL VERDICT
+# =========================================================
+
+def overall_verdict(score):
+
+    if score >= 85:
+        return "Strongly supported"
+
+    if score >= 70:
+        return "Mostly supported"
+
+    if score >= 55:
+        return "Mixed / needs verification"
+
+    if score >= 35:
+        return "Likely false / weak evidence"
+
+    return "Strongly contradicted"
+
+
+# =========================================================
+# ANALYZE
+# =========================================================
+
+@app.post("/api/analyze")
+def analyze(req: AnalyzeRequest):
+
+    text = clean(req.text)
+    source_title = ""
+
+    # ---------------------------------------------
+    # URL MODE
+    # ---------------------------------------------
+
+    if req.url.strip():
+
+        url = clean(req.url)
+
+        if not url.startswith(
+            ("http://", "https://")
+        ):
+            raise HTTPException(
+                400,
+                "Please enter a valid URL."
+            )
+
+        source_title, text = extract_article(url)
+
+    if len(text) < 20:
+
+        raise HTTPException(
+            400,
+            "Please provide a paragraph or article URL."
+        )
+
+    # ---------------------------------------------
+    # CLAIMS
+    # ---------------------------------------------
+
+    claims = claims_from(text)
+
+    results = []
+    all_sources = []
+
+    # ---------------------------------------------
+    # FACT CHECK EACH CLAIM
+    # ---------------------------------------------
+
+    for claim in claims:
+
+        evidence = search_web(claim)
+
+        verification = fact_check_claim(
+            claim,
+            evidence
+        )
+
+        results.append({
+            "claim": claim,
+            "support": verification["score"],
+            "verdict": verification["verdict"],
+            "reason": verification["reason"],
+            "confidence": verification["confidence"],
+            "evidence": evidence
+        })
+
+        all_sources.extend(evidence)
+
+    # ---------------------------------------------
+    # OVERALL SCORE
+    # ---------------------------------------------
+
+    if results:
+
+        weighted_scores = []
+
+        for result in results:
+
+            # Confidence slightly affects the final score,
+            # but never dominates the AI judgement.
+            score = result["support"]
+            confidence = result["confidence"]
+
+            weight = 0.75 + (
+                confidence / 100
+            ) * 0.25
+
+            weighted_scores.append(
+                score * weight
+            )
+
+        final_score = round(
+            sum(weighted_scores)
+            / sum(
+                0.75 + (
+                    r["confidence"] / 100
+                ) * 0.25
+                for r in results
+            )
+        )
+
+    else:
+        final_score = 50
+
+    # ---------------------------------------------
+    # RELATED SOURCES
+    # ---------------------------------------------
+
+    related = []
+    seen = set()
+
+    # First prefer reliable sources
+    priority_order = {
+        "very_high": 0,
+        "high": 1,
+        "medium": 2,
+        "unknown": 3
+    }
+
+    all_sources.sort(
+        key=lambda x: priority_order.get(
+            x.get("source_quality", "unknown"),
+            3
+        )
+    )
+
+    for source in all_sources:
+
+        url = source.get("url", "")
+
+        if not url:
+            continue
+
+        if url in seen:
+            continue
+
+        seen.add(url)
+
+        related.append(source)
+
+        if len(related) >= 10:
+            break
+
+    return {
+        "truth_score": final_score,
+        "verdict": overall_verdict(
+            final_score
+        ),
+        "source_title": source_title,
+        "claims_analyzed": len(claims),
+        "claims": results,
+        "related_information": related,
+        "demo_mode": not bool(
+            SERPER_API_KEY
+        ),
+        "ai_mode": bool(
+            GEMINI_API_KEY
+        ),
+        "disclaimer": (
+            "This is an evidence-based AI estimate, "
+            "not a guarantee of truth. Always inspect "
+            "the cited sources for important claims."
+        )
+    }
+
+
+# =========================================================
+# BASIC ROUTES
+# =========================================================
+
+@app.get("/")
+def home():
+
+    return FileResponse(
+        os.path.join(
+            FRONTEND,
+            "index.html"
+        )
+    )
+
+
+@app.get("/health")
+def health():
+
+    return {
+        "status": "ok",
+        "serper_configured": bool(
+            SERPER_API_KEY
+        ),
+        "gemini_configured": bool(
+            GEMINI_API_KEY
+        )
+    }import os
+import re
+import json
+from urllib.parse import urlparse
+
+import requests
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+
+load_dotenv()
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+FRONTEND = BASE
+
+SERPER_API_KEY = os.getenv("SERPER_API_KEY", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+
+GEMINI_MODEL = "gemini-3.8-flash"
+
+app = FastAPI(
+    title="TruthCheck API",
+    version="3.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.mount(
+    "/static",
+    StaticFiles(directory=FRONTEND),
+    name="static"
+)
+
+
+class AnalyzeRequest(BaseModel):
+    text: str = Field("", max_length=50000)
+    url: str = Field("", max_length=2000)
+
+
+# =========================================================
+# BASIC HELPERS
+# =========================================================
+
+def clean(text):
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def extract_article(url):
+    try:
+        response = requests.get(
+            url,
+            timeout=15,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 "
+                    "(Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 "
+                    "Chrome/120 Safari/537.36"
+                )
+            }
+        )
+
+        response.raise_for_status()
+
+        soup = BeautifulSoup(
+            response.text,
+            "html.parser"
+        )
+
+        for tag in soup([
+            "script",
+            "style",
+            "noscript",
+            "nav",
+            "footer",
+            "header",
+            "aside"
+        ]):
+            tag.decompose()
+
+        title = (
+            soup.title.get_text(" ", strip=True)
+            if soup.title
+            else url
+        )
+
+        paragraphs = []
+
+        for p in soup.find_all("p"):
+            text = clean(p.get_text(" ", strip=True))
+
+            if len(text) >= 30:
+                paragraphs.append(text)
+
+        body = clean(" ".join(paragraphs))
+
+        if len(body) < 100:
+            body = clean(
+                soup.get_text(" ", strip=True)
+            )
+
+        return title, body[:50000]
+
+    except Exception as e:
+        raise HTTPException(
+            400,
+            f"Could not read article URL: {e}"
+        )
+
+
+# =========================================================
+# CLAIM EXTRACTION
+# =========================================================
+
+def claims_from(text):
+
+    text = clean(text)
+
+    parts = re.split(
+        r"(?<=[.!?])\s+",
+        text
+    )
+
+    claims = []
+
+    for part in parts:
+
+        part = part.strip()
+
+        if 25 <= len(part) <= 700:
+            claims.append(part)
+
+    if not claims:
+        return [text[:700]]
+
+    return claims[:10]
+
+
+# =========================================================
+# SOURCE QUALITY
+# =========================================================
+
+def source_quality(url):
+
+    domain = urlparse(url).netloc.lower()
+
+    # Extremely strong sources
+    very_high = [
+        ".gov",
+        ".gov.in",
+        ".nic.in",
+        "worldbank.org",
+        "imf.org",
+        "who.int",
+        "un.org",
+        "unicef.org",
+        "rbi.org.in",
+        "nasa.gov",
+        "isro.gov.in",
+        "oecd.org",
+        "ec.europa.eu",
+    ]
+
+    for source in very_high:
+        if source in domain:
+            return "very_high"
+
+    # Strong news organizations
+    high = [
+        "reuters.com",
+        "apnews.com",
+        "bbc.com",
+        "bbc.co.uk",
+        "thehindu.com",
+        "indianexpress.com",
+        "ndtv.com",
+        "economictimes.indiatimes.com",
+        "livemint.com",
+        "hindustantimes.com",
+    ]
+
+    for source in high:
+        if source in domain:
+            return "high"
+
+    # Known but not authoritative
+    medium = [
+        "timesofindia.indiatimes.com",
+        "news18.com",
+        "moneycontrol.com",
+        "business-standard.com",
+    ]
+
+    for source in medium:
+        if source in domain:
+            return "medium"
+
+    return "unknown"
+
+
+# =========================================================
+# SERPER / GOOGLE SEARCH
+# =========================================================
+
+def search_web(claim):
+
+    if not SERPER_API_KEY:
+        return []
+
+    queries = [
+        claim,
+        f'"{claim}" fact check',
+    ]
+
+    results = []
+    seen = set()
+
+    for query in queries:
+
+        try:
+
+            response = requests.post(
+                "https://google.serper.dev/search",
+                headers={
+                    "X-API-KEY": SERPER_API_KEY,
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "q": query,
+                    "num": 8
+                },
+                timeout=15
+            )
+
+            response.raise_for_status()
+
+            data = response.json()
+
+            for item in data.get("organic", []):
+
+                url = item.get("link", "").strip()
+
+                if not url:
+                    continue
+
+                if url in seen:
+                    continue
+
+                seen.add(url)
+
+                results.append({
+                    "title": clean(
+                        item.get("title", "Untitled")
+                    ),
+                    "snippet": clean(
+                        item.get("snippet", "")
+                    ),
+                    "url": url,
+                    "publisher": urlparse(url).netloc,
+                    "source_quality": source_quality(url),
+                    "is_demo": False
+                })
+
+        except Exception:
+            continue
+
+    return results[:12]
+
+
+# =========================================================
+# GEMINI
+# =========================================================
+
+def gemini_request(prompt):
+
+    if not GEMINI_API_KEY:
+        return None
+
+    url = (
+        "https://generativelanguage.googleapis.com/"
+        f"v1beta/models/{GEMINI_MODEL}:generateContent"
+        f"?key={GEMINI_API_KEY}"
+    )
+
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {
+                        "text": prompt
+                    }
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.1,
+            "maxOutputTokens": 2000,
+            "responseMimeType": "application/json"
+        }
+    }
+
+    try:
+
+        response = requests.post(
+            url,
+            headers={
+                "Content-Type": "application/json"
+            },
+            json=payload,
+            timeout=30
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        candidates = data.get(
+            "candidates",
+            []
+        )
+
+        if not candidates:
+            return None
+
+        parts = (
+            candidates[0]
+            .get("content", {})
+            .get("parts", [])
+        )
+
+        if not parts:
+            return None
+
+        output = parts[0].get(
+            "text",
+            ""
+        ).strip()
+
+        if not output:
+            return None
+
+        # Remove accidental markdown fences
+        output = re.sub(
+            r"^```json\s*",
+            "",
+            output,
+            flags=re.IGNORECASE
+        )
+
+        output = re.sub(
+            r"\s*```$",
+            "",
+            output
+        )
+
+        return json.loads(output)
+
+    except Exception:
+        return None
+
+
+# =========================================================
+# CLAIM FACT CHECK
+# =========================================================
+
+def fact_check_claim(claim, evidence):
+
+    if not evidence:
+
+        return {
+            "score": 50,
+            "verdict": "UNCERTAIN",
+            "reason": (
+                "No reliable web evidence was found "
+                "for this claim."
+            ),
+            "confidence": 20,
+            "key_evidence": []
+        }
+
+    evidence_text = []
+
+    for i, item in enumerate(evidence, 1):
+
+        evidence_text.append(
+            f"""
+SOURCE {i}
+Title: {item['title']}
+Publisher: {item['publisher']}
+Source quality: {item['source_quality']}
+URL: {item['url']}
+Snippet: {item['snippet']}
+"""
+        )
+
+    evidence_block = "\n".join(evidence_text)
+
+    prompt = f"""
+You are the fact-checking engine of a news verification website.
+
+Your task is to determine whether the USER CLAIM is supported,
+contradicted, or uncertain based ONLY on the provided web evidence.
+
+USER CLAIM:
+{claim}
+
+WEB EVIDENCE:
+{evidence_block}
+
+IMPORTANT RULES:
+
+1. Do NOT assume the user's claim is true.
+
+2. Do NOT decide that a claim is true simply because Google
+   returned search results.
+
+3. Compare the actual meaning of the claim with the evidence.
+
+4. Carefully check:
+   - numbers
+   - percentages
+   - dates
+   - years
+   - names
+   - locations
+   - quantities
+   - cause/effect statements
+   - "before/after" statements
+
+5. A source that merely discusses the same topic is NOT proof
+   that the claim is true.
+
+6. Prefer high-quality sources:
+   government, official institutions, World Bank, IMF, WHO,
+   RBI, research organizations, Reuters, AP, BBC and other
+   established sources.
+
+7. If multiple reliable sources agree, confidence should increase.
+
+8. If reliable sources directly contradict the claim,
+   the claim should be CONTRADICTED.
+
+9. If evidence is incomplete or ambiguous, use UNCERTAIN.
+
+10. Never invent facts.
+
+11. Never invent a source.
+
+12. Do not use your own memory when the supplied evidence
+    can answer the question.
+
+13. If sources disagree, mention the disagreement.
+
+14. Do NOT give 80-90% merely because many search results
+    exist.
+
+15. The score represents how strongly the available evidence
+    supports the claim:
+       90-100 = very strong support
+       75-89  = strong support
+       55-74  = moderate / mixed support
+       35-54  = weak / uncertain
+       0-34   = strong contradiction
+
+16. If the evidence directly contradicts an important numerical
+    or factual part of the claim, score should normally be below 35.
+
+17. If there is not enough evidence to decide, keep the score
+    around 45-55 rather than guessing.
+
+Return ONLY valid JSON:
+
+{{
+    "score": integer between 0 and 100,
+    "verdict": "SUPPORTED" or "CONTRADICTED" or "UNCERTAIN",
+    "reason": "short explanation of why",
+    "confidence": integer between 0 and 100,
+    "key_evidence": [
+        {{
+            "source_number": integer,
+            "finding": "short explanation"
+        }}
+    ]
+}}
+"""
+
+    result = gemini_request(prompt)
+
+    if not result:
+        return {
+            "score": 50,
+            "verdict": "UNCERTAIN",
+            "reason": (
+                "AI verification could not be completed. "
+                "Please verify using the listed sources."
+            ),
+            "confidence": 0,
+            "key_evidence": []
+        }
+
+    # Safety / validation
+    try:
+        score = int(result.get("score", 50))
+    except Exception:
+        score = 50
+
+    score = max(0, min(100, score))
+
+    verdict_value = str(
+        result.get("verdict", "UNCERTAIN")
+    ).upper()
+
+    if verdict_value not in [
+        "SUPPORTED",
+        "CONTRADICTED",
+        "UNCERTAIN"
+    ]:
+        verdict_value = "UNCERTAIN"
+
+    return {
+        "score": score,
+        "verdict": verdict_value,
+        "reason": clean(
+            str(
+                result.get(
+                    "reason",
+                    "Insufficient evidence."
+                )
+            )
+        ),
+        "confidence": max(
+            0,
+            min(
+                100,
+                int(
+                    result.get(
+                        "confidence",
+                        50
+                    )
+                )
+            )
+        ),
+        "key_evidence": result.get(
+            "key_evidence",
+            []
+        )
+    }
+
+
+# =========================================================
+# OVERALL VERDICT
+# =========================================================
+
+def overall_verdict(score):
+
+    if score >= 85:
+        return "Strongly supported"
+
+    if score >= 70:
+        return "Mostly supported"
+
+    if score >= 55:
+        return "Mixed / needs verification"
+
+    if score >= 35:
+        return "Likely false / weak evidence"
+
+    return "Strongly contradicted"
+
+
+# =========================================================
+# ANALYZE
+# =========================================================
+
+@app.post("/api/analyze")
+def analyze(req: AnalyzeRequest):
+
+    text = clean(req.text)
+    source_title = ""
+
+    # ---------------------------------------------
+    # URL MODE
+    # ---------------------------------------------
+
+    if req.url.strip():
+
+        url = clean(req.url)
+
+        if not url.startswith(
+            ("http://", "https://")
+        ):
+            raise HTTPException(
+                400,
+                "Please enter a valid URL."
+            )
+
+        source_title, text = extract_article(url)
+
+    if len(text) < 20:
+
+        raise HTTPException(
+            400,
+            "Please provide a paragraph or article URL."
+        )
+
+    # ---------------------------------------------
+    # CLAIMS
+    # ---------------------------------------------
+
+    claims = claims_from(text)
+
+    results = []
+    all_sources = []
+
+    # ---------------------------------------------
+    # FACT CHECK EACH CLAIM
+    # ---------------------------------------------
+
+    for claim in claims:
+
+        evidence = search_web(claim)
+
+        verification = fact_check_claim(
+            claim,
+            evidence
+        )
+
+        results.append({
+            "claim": claim,
+            "support": verification["score"],
+            "verdict": verification["verdict"],
+            "reason": verification["reason"],
+            "confidence": verification["confidence"],
+            "evidence": evidence
+        })
+
+        all_sources.extend(evidence)
+
+    # ---------------------------------------------
+    # OVERALL SCORE
+    # ---------------------------------------------
+
+    if results:
+
+        weighted_scores = []
+
+        for result in results:
+
+            # Confidence slightly affects the final score,
+            # but never dominates the AI judgement.
+            score = result["support"]
+            confidence = result["confidence"]
+
+            weight = 0.75 + (
+                confidence / 100
+            ) * 0.25
+
+            weighted_scores.append(
+                score * weight
+            )
+
+        final_score = round(
+            sum(weighted_scores)
+            / sum(
+                0.75 + (
+                    r["confidence"] / 100
+                ) * 0.25
+                for r in results
+            )
+        )
+
+    else:
+        final_score = 50
+
+    # ---------------------------------------------
+    # RELATED SOURCES
+    # ---------------------------------------------
+
+    related = []
+    seen = set()
+
+    # First prefer reliable sources
+    priority_order = {
+        "very_high": 0,
+        "high": 1,
+        "medium": 2,
+        "unknown": 3
+    }
+
+    all_sources.sort(
+        key=lambda x: priority_order.get(
+            x.get("source_quality", "unknown"),
+            3
+        )
+    )
+
+    for source in all_sources:
+
+        url = source.get("url", "")
+
+        if not url:
+            continue
+
+        if url in seen:
+            continue
+
+        seen.add(url)
+
+        related.append(source)
+
+        if len(related) >= 10:
+            break
+
+    return {
+        "truth_score": final_score,
+        "verdict": overall_verdict(
+            final_score
+        ),
+        "source_title": source_title,
+        "claims_analyzed": len(claims),
+        "claims": results,
+        "related_information": related,
+        "demo_mode": not bool(
+            SERPER_API_KEY
+        ),
+        "ai_mode": bool(
+            GEMINI_API_KEY
+        ),
+        "disclaimer": (
+            "This is an evidence-based AI estimate, "
+            "not a guarantee of truth. Always inspect "
+            "the cited sources for important claims."
+        )
+    }
+
+
+# =========================================================
+# BASIC ROUTES
+# =========================================================
+
+@app.get("/")
+def home():
+
+    return FileResponse(
+        os.path.join(
+            FRONTEND,
+            "index.html"
+        )
+    )
+
+
+@app.get("/health")
+def health():
+
+    return {
+        "status": "ok",
+        "serper_configured": bool(
+            SERPER_API_KEY
+        ),
+        "gemini_configured": bool(
+            GEMINI_API_KEY
+        )
+    }import os
+import re
+import json
+from urllib.parse import urlparse
+
+import requests
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+
+load_dotenv()
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+FRONTEND = BASE
+
+SERPER_API_KEY = os.getenv("SERPER_API_KEY", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+
+GEMINI_MODEL = "gemini-3.8-flash"
+
+app = FastAPI(
+    title="TruthCheck API",
+    version="3.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.mount(
+    "/static",
+    StaticFiles(directory=FRONTEND),
+    name="static"
+)
+
+
+class AnalyzeRequest(BaseModel):
+    text: str = Field("", max_length=50000)
+    url: str = Field("", max_length=2000)
+
+
+# =========================================================
+# BASIC HELPERS
+# =========================================================
+
+def clean(text):
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def extract_article(url):
+    try:
+        response = requests.get(
+            url,
+            timeout=15,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 "
+                    "(Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 "
+                    "Chrome/120 Safari/537.36"
+                )
+            }
+        )
+
+        response.raise_for_status()
+
+        soup = BeautifulSoup(
+            response.text,
+            "html.parser"
+        )
+
+        for tag in soup([
+            "script",
+            "style",
+            "noscript",
+            "nav",
+            "footer",
+            "header",
+            "aside"
+        ]):
+            tag.decompose()
+
+        title = (
+            soup.title.get_text(" ", strip=True)
+            if soup.title
+            else url
+        )
+
+        paragraphs = []
+
+        for p in soup.find_all("p"):
+            text = clean(p.get_text(" ", strip=True))
+
+            if len(text) >= 30:
+                paragraphs.append(text)
+
+        body = clean(" ".join(paragraphs))
+
+        if len(body) < 100:
+            body = clean(
+                soup.get_text(" ", strip=True)
+            )
+
+        return title, body[:50000]
+
+    except Exception as e:
+        raise HTTPException(
+            400,
+            f"Could not read article URL: {e}"
+        )
+
+
+# =========================================================
+# CLAIM EXTRACTION
+# =========================================================
+
+def claims_from(text):
+
+    text = clean(text)
+
+    parts = re.split(
+        r"(?<=[.!?])\s+",
+        text
+    )
+
+    claims = []
+
+    for part in parts:
+
+        part = part.strip()
+
+        if 25 <= len(part) <= 700:
+            claims.append(part)
+
+    if not claims:
+        return [text[:700]]
+
+    return claims[:10]
+
+
+# =========================================================
+# SOURCE QUALITY
+# =========================================================
+
+def source_quality(url):
+
+    domain = urlparse(url).netloc.lower()
+
+    # Extremely strong sources
+    very_high = [
+        ".gov",
+        ".gov.in",
+        ".nic.in",
+        "worldbank.org",
+        "imf.org",
+        "who.int",
+        "un.org",
+        "unicef.org",
+        "rbi.org.in",
+        "nasa.gov",
+        "isro.gov.in",
+        "oecd.org",
+        "ec.europa.eu",
+    ]
+
+    for source in very_high:
+        if source in domain:
+            return "very_high"
+
+    # Strong news organizations
+    high = [
+        "reuters.com",
+        "apnews.com",
+        "bbc.com",
+        "bbc.co.uk",
+        "thehindu.com",
+        "indianexpress.com",
+        "ndtv.com",
+        "economictimes.indiatimes.com",
+        "livemint.com",
+        "hindustantimes.com",
+    ]
+
+    for source in high:
+        if source in domain:
+            return "high"
+
+    # Known but not authoritative
+    medium = [
+        "timesofindia.indiatimes.com",
+        "news18.com",
+        "moneycontrol.com",
+        "business-standard.com",
+    ]
+
+    for source in medium:
+        if source in domain:
+            return "medium"
+
+    return "unknown"
+
+
+# =========================================================
+# SERPER / GOOGLE SEARCH
+# =========================================================
+
+def search_web(claim):
+
+    if not SERPER_API_KEY:
+        return []
+
+    queries = [
+        claim,
+        f'"{claim}" fact check',
+    ]
+
+    results = []
+    seen = set()
+
+    for query in queries:
+
+        try:
+
+            response = requests.post(
+                "https://google.serper.dev/search",
+                headers={
+                    "X-API-KEY": SERPER_API_KEY,
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "q": query,
+                    "num": 8
+                },
+                timeout=15
+            )
+
+            response.raise_for_status()
+
+            data = response.json()
+
+            for item in data.get("organic", []):
+
+                url = item.get("link", "").strip()
+
+                if not url:
+                    continue
+
+                if url in seen:
+                    continue
+
+                seen.add(url)
+
+                results.append({
+                    "title": clean(
+                        item.get("title", "Untitled")
+                    ),
+                    "snippet": clean(
+                        item.get("snippet", "")
+                    ),
+                    "url": url,
+                    "publisher": urlparse(url).netloc,
+                    "source_quality": source_quality(url),
+                    "is_demo": False
+                })
+
+        except Exception:
+            continue
+
+    return results[:12]
+
+
+# =========================================================
+# GEMINI
+# =========================================================
+
+def gemini_request(prompt):
+
+    if not GEMINI_API_KEY:
+        return None
+
+    url = (
+        "https://generativelanguage.googleapis.com/"
+        f"v1beta/models/{GEMINI_MODEL}:generateContent"
+        f"?key={GEMINI_API_KEY}"
+    )
+
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {
+                        "text": prompt
+                    }
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.1,
+            "maxOutputTokens": 2000,
+            "responseMimeType": "application/json"
+        }
+    }
+
+    try:
+
+        response = requests.post(
+            url,
+            headers={
+                "Content-Type": "application/json"
+            },
+            json=payload,
+            timeout=30
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        candidates = data.get(
+            "candidates",
+            []
+        )
+
+        if not candidates:
+            return None
+
+        parts = (
+            candidates[0]
+            .get("content", {})
+            .get("parts", [])
+        )
+
+        if not parts:
+            return None
+
+        output = parts[0].get(
+            "text",
+            ""
+        ).strip()
+
+        if not output:
+            return None
+
+        # Remove accidental markdown fences
+        output = re.sub(
+            r"^```json\s*",
+            "",
+            output,
+            flags=re.IGNORECASE
+        )
+
+        output = re.sub(
+            r"\s*```$",
+            "",
+            output
+        )
+
+        return json.loads(output)
+
+    except Exception:
+        return None
+
+
+# =========================================================
+# CLAIM FACT CHECK
+# =========================================================
+
+def fact_check_claim(claim, evidence):
+
+    if not evidence:
+
+        return {
+            "score": 50,
+            "verdict": "UNCERTAIN",
+            "reason": (
+                "No reliable web evidence was found "
+                "for this claim."
+            ),
+            "confidence": 20,
+            "key_evidence": []
+        }
+
+    evidence_text = []
+
+    for i, item in enumerate(evidence, 1):
+
+        evidence_text.append(
+            f"""
+SOURCE {i}
+Title: {item['title']}
+Publisher: {item['publisher']}
+Source quality: {item['source_quality']}
+URL: {item['url']}
+Snippet: {item['snippet']}
+"""
+        )
+
+    evidence_block = "\n".join(evidence_text)
+
+    prompt = f"""
+You are the fact-checking engine of a news verification website.
+
+Your task is to determine whether the USER CLAIM is supported,
+contradicted, or uncertain based ONLY on the provided web evidence.
+
+USER CLAIM:
+{claim}
+
+WEB EVIDENCE:
+{evidence_block}
+
+IMPORTANT RULES:
+
+1. Do NOT assume the user's claim is true.
+
+2. Do NOT decide that a claim is true simply because Google
+   returned search results.
+
+3. Compare the actual meaning of the claim with the evidence.
+
+4. Carefully check:
+   - numbers
+   - percentages
+   - dates
+   - years
+   - names
+   - locations
+   - quantities
+   - cause/effect statements
+   - "before/after" statements
+
+5. A source that merely discusses the same topic is NOT proof
+   that the claim is true.
+
+6. Prefer high-quality sources:
+   government, official institutions, World Bank, IMF, WHO,
+   RBI, research organizations, Reuters, AP, BBC and other
+   established sources.
+
+7. If multiple reliable sources agree, confidence should increase.
+
+8. If reliable sources directly contradict the claim,
+   the claim should be CONTRADICTED.
+
+9. If evidence is incomplete or ambiguous, use UNCERTAIN.
+
+10. Never invent facts.
+
+11. Never invent a source.
+
+12. Do not use your own memory when the supplied evidence
+    can answer the question.
+
+13. If sources disagree, mention the disagreement.
+
+14. Do NOT give 80-90% merely because many search results
+    exist.
+
+15. The score represents how strongly the available evidence
+    supports the claim:
+       90-100 = very strong support
+       75-89  = strong support
+       55-74  = moderate / mixed support
+       35-54  = weak / uncertain
+       0-34   = strong contradiction
+
+16. If the evidence directly contradicts an important numerical
+    or factual part of the claim, score should normally be below 35.
+
+17. If there is not enough evidence to decide, keep the score
+    around 45-55 rather than guessing.
+
+Return ONLY valid JSON:
+
+{{
+    "score": integer between 0 and 100,
+    "verdict": "SUPPORTED" or "CONTRADICTED" or "UNCERTAIN",
+    "reason": "short explanation of why",
+    "confidence": integer between 0 and 100,
+    "key_evidence": [
+        {{
+            "source_number": integer,
+            "finding": "short explanation"
+        }}
+    ]
+}}
+"""
+
+    result = gemini_request(prompt)
+
+    if not result:
+        return {
+            "score": 50,
+            "verdict": "UNCERTAIN",
+            "reason": (
+                "AI verification could not be completed. "
+                "Please verify using the listed sources."
+            ),
+            "confidence": 0,
+            "key_evidence": []
+        }
+
+    # Safety / validation
+    try:
+        score = int(result.get("score", 50))
+    except Exception:
+        score = 50
+
+    score = max(0, min(100, score))
+
+    verdict_value = str(
+        result.get("verdict", "UNCERTAIN")
+    ).upper()
+
+    if verdict_value not in [
+        "SUPPORTED",
+        "CONTRADICTED",
+        "UNCERTAIN"
+    ]:
+        verdict_value = "UNCERTAIN"
+
+    return {
+        "score": score,
+        "verdict": verdict_value,
+        "reason": clean(
+            str(
+                result.get(
+                    "reason",
+                    "Insufficient evidence."
+                )
+            )
+        ),
+        "confidence": max(
+            0,
+            min(
+                100,
+                int(
+                    result.get(
+                        "confidence",
+                        50
+                    )
+                )
+            )
+        ),
+        "key_evidence": result.get(
+            "key_evidence",
+            []
+        )
+    }
+
+
+# =========================================================
+# OVERALL VERDICT
+# =========================================================
+
+def overall_verdict(score):
+
+    if score >= 85:
+        return "Strongly supported"
+
+    if score >= 70:
+        return "Mostly supported"
+
+    if score >= 55:
+        return "Mixed / needs verification"
+
+    if score >= 35:
+        return "Likely false / weak evidence"
+
+    return "Strongly contradicted"
+
+
+# =========================================================
+# ANALYZE
+# =========================================================
+
+@app.post("/api/analyze")
+def analyze(req: AnalyzeRequest):
+
+    text = clean(req.text)
+    source_title = ""
+
+    # ---------------------------------------------
+    # URL MODE
+    # ---------------------------------------------
+
+    if req.url.strip():
+
+        url = clean(req.url)
+
+        if not url.startswith(
+            ("http://", "https://")
+        ):
+            raise HTTPException(
+                400,
+                "Please enter a valid URL."
+            )
+
+        source_title, text = extract_article(url)
+
+    if len(text) < 20:
+
+        raise HTTPException(
+            400,
+            "Please provide a paragraph or article URL."
+        )
+
+    # ---------------------------------------------
+    # CLAIMS
+    # ---------------------------------------------
+
+    claims = claims_from(text)
+
+    results = []
+    all_sources = []
+
+    # ---------------------------------------------
+    # FACT CHECK EACH CLAIM
+    # ---------------------------------------------
+
+    for claim in claims:
+
+        evidence = search_web(claim)
+
+        verification = fact_check_claim(
+            claim,
+            evidence
+        )
+
+        results.append({
+            "claim": claim,
+            "support": verification["score"],
+            "verdict": verification["verdict"],
+            "reason": verification["reason"],
+            "confidence": verification["confidence"],
+            "evidence": evidence
+        })
+
+        all_sources.extend(evidence)
+
+    # ---------------------------------------------
+    # OVERALL SCORE
+    # ---------------------------------------------
+
+    if results:
+
+        weighted_scores = []
+
+        for result in results:
+
+            # Confidence slightly affects the final score,
+            # but never dominates the AI judgement.
+            score = result["support"]
+            confidence = result["confidence"]
+
+            weight = 0.75 + (
+                confidence / 100
+            ) * 0.25
+
+            weighted_scores.append(
+                score * weight
+            )
+
+        final_score = round(
+            sum(weighted_scores)
+            / sum(
+                0.75 + (
+                    r["confidence"] / 100
+                ) * 0.25
+                for r in results
+            )
+        )
+
+    else:
+        final_score = 50
+
+    # ---------------------------------------------
+    # RELATED SOURCES
+    # ---------------------------------------------
+
+    related = []
+    seen = set()
+
+    # First prefer reliable sources
+    priority_order = {
+        "very_high": 0,
+        "high": 1,
+        "medium": 2,
+        "unknown": 3
+    }
+
+    all_sources.sort(
+        key=lambda x: priority_order.get(
+            x.get("source_quality", "unknown"),
+            3
+        )
+    )
+
+    for source in all_sources:
+
+        url = source.get("url", "")
+
+        if not url:
+            continue
+
+        if url in seen:
+            continue
+
+        seen.add(url)
+
+        related.append(source)
+
+        if len(related) >= 10:
+            break
+
+    return {
+        "truth_score": final_score,
+        "verdict": overall_verdict(
+            final_score
+        ),
+        "source_title": source_title,
+        "claims_analyzed": len(claims),
+        "claims": results,
+        "related_information": related,
+        "demo_mode": not bool(
+            SERPER_API_KEY
+        ),
+        "ai_mode": bool(
+            GEMINI_API_KEY
+        ),
+        "disclaimer": (
+            "This is an evidence-based AI estimate, "
+            "not a guarantee of truth. Always inspect "
+            "the cited sources for important claims."
+        )
+    }
+
+
+# =========================================================
+# BASIC ROUTES
+# =========================================================
+
+@app.get("/")
+def home():
+
+    return FileResponse(
+        os.path.join(
+            FRONTEND,
+            "index.html"
+        )
+    )
+
+
+@app.get("/health")
+def health():
+
+    return {
+        "status": "ok",
+        "serper_configured": bool(
+            SERPER_API_KEY
+        ),
+        "gemini_configured": bool(
+            GEMINI_API_KEY
         )
     }
